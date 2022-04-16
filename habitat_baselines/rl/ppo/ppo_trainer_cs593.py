@@ -9,16 +9,18 @@ import os
 import random
 import time
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union, Type
 
+import gym
 import numpy as np
 import torch
 import tqdm
 from gym import spaces
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
+import habitat
 
-from habitat import Config, VectorEnv, logger
+from habitat import Config, logger, Env, RLEnv, VectorEnv, make_dataset
 from habitat.utils import profiling_wrapper
 from habitat.utils.visualizations.utils import observations_to_image
 from habitat_baselines.common.base_trainer import BaseRLTrainer
@@ -29,7 +31,7 @@ from habitat_baselines.common.obs_transformers import (
     apply_obs_transforms_obs_space,
     get_active_obs_transforms,
 )
-from habitat_baselines.common.rollout_storage import RolloutStorage
+from habitat_baselines.rl.ppo.ppo import RolloutStorage
 from habitat_baselines.common.tensorboard_utils import TensorboardWriter
 from habitat_baselines.rl.ddppo.algo import DDPPO
 from habitat_baselines.rl.ddppo.ddp_utils import (
@@ -54,12 +56,122 @@ from habitat_baselines.utils.common import (
     batch_obs,
     generate_video,
 )
-from habitat_baselines.utils.env_utils import construct_envs
 
 
-@baseline_registry.register_trainer(name="ddppo")
-@baseline_registry.register_trainer(name="ppo")
-class PPOTrainer(BaseRLTrainer):
+
+def make_env_fn(
+    config: Config, env_class: Union[Type[Env], Type[RLEnv]]
+) -> Union[Env, RLEnv]:
+    r"""Creates an env of type env_class with specified config and rank.
+    This is to be passed in as an argument when creating VectorEnv.
+
+    Args:
+        config: root exp config that has core env config node as well as
+            env-specific config node.
+        env_class: class type of the env to be created.
+
+    Returns:
+        env object created according to specification.
+    """
+    dataset = make_dataset(
+        config.TASK_CONFIG.DATASET.TYPE, config=config.TASK_CONFIG.DATASET
+    )
+    env = env_class(config=config, dataset=dataset)
+    env.seed(config.TASK_CONFIG.SEED)
+    return env
+
+
+def construct_envs(
+    config: Config,
+    env_class: Union[Type[Env], Type[RLEnv]],
+    workers_ignore_signals: bool = False,
+) -> VectorEnv:
+    r"""Create VectorEnv object with specified config and env class type.
+    To allow better performance, dataset are split into small ones for
+    each individual env, grouped by scenes.
+
+    :param config: configs that contain num_environments as well as information
+    :param necessary to create individual environments.
+    :param env_class: class type of the envs to be created.
+    :param workers_ignore_signals: Passed to :ref:`habitat.VectorEnv`'s constructor
+
+    :return: VectorEnv object created according to specification.
+    """
+
+    num_environments = config.NUM_ENVIRONMENTS
+    configs = []
+    env_classes = [env_class for _ in range(num_environments)]
+    print("\n\n\n\nDataset config : \n{}\n\n\n ".format(config.TASK_CONFIG.DATASET))
+    dataset = make_dataset(config.TASK_CONFIG.DATASET.TYPE)
+    scenes = config.TASK_CONFIG.DATASET.CONTENT_SCENES
+    if "*" in config.TASK_CONFIG.DATASET.CONTENT_SCENES:
+        scenes = dataset.get_scenes_to_load(config.TASK_CONFIG.DATASET)
+
+    if num_environments > 1:
+        if len(scenes) == 0:
+            raise RuntimeError(
+                "No scenes to load, multiple process logic relies on being able to split scenes uniquely between processes"
+            )
+
+        if len(scenes) < num_environments:
+            raise RuntimeError(
+                "reduce the number of environments as there "
+                "aren't enough number of scenes.\n"
+                "num_environments: {}\tnum_scenes: {}".format(
+                    num_environments, len(scenes)
+                )
+            )
+
+        random.shuffle(scenes)
+
+    scene_splits: List[List[str]] = [[] for _ in range(num_environments)]
+    for idx, scene in enumerate(scenes):
+        scene_splits[idx % len(scene_splits)].append(scene)
+
+    assert sum(map(len, scene_splits)) == len(scenes)
+
+    for i in range(num_environments):
+        proc_config = config.clone()
+        proc_config.defrost()
+
+        task_config = proc_config.TASK_CONFIG
+        task_config.SEED = task_config.SEED + i
+        if len(scenes) > 0:
+            task_config.DATASET.CONTENT_SCENES = scene_splits[i]
+
+        task_config.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID = (
+            config.SIMULATOR_GPU_ID
+        )
+
+        task_config.SIMULATOR.AGENT_0.SENSORS = config.SENSORS
+
+        task_config.ENVIRONMENT.MAX_EPISODE_STEPS = config.ARCHITECTURE.max_episode_length
+
+        task_config.SIMULATOR.RGB_SENSOR.WIDTH = config.ARCHITECTURE.env_frame_width
+        task_config.SIMULATOR.RGB_SENSOR.HEIGHT = config.ARCHITECTURE.env_frame_height
+        task_config.SIMULATOR.RGB_SENSOR.HFOV = config.ARCHITECTURE.fov
+        task_config.SIMULATOR.RGB_SENSOR.POSITION = [0, config.ARCHITECTURE.camera_height, 0]
+
+        task_config.SIMULATOR.DEPTH_SENSOR.WIDTH = config.ARCHITECTURE.env_frame_width
+        task_config.SIMULATOR.DEPTH_SENSOR.HEIGHT = config.ARCHITECTURE.env_frame_height
+        task_config.SIMULATOR.DEPTH_SENSOR.HFOV = config.ARCHITECTURE.fov
+        task_config.SIMULATOR.DEPTH_SENSOR.POSITION = [0, config.ARCHITECTURE.camera_height, 0]
+
+        proc_config.freeze()
+        configs.append(proc_config)
+
+    envs = habitat.VectorEnv(
+        make_env_fn=make_env_fn,
+        env_fn_args=tuple(zip(configs, env_classes)),
+        workers_ignore_signals=workers_ignore_signals,
+    )
+    return envs
+
+
+
+@baseline_registry.register_trainer(name="ddppo_cs593")
+@baseline_registry.register_trainer(name="ppo_cs593")
+class PPOTrainer_CS593(BaseRLTrainer):
     r"""Trainer class for PPO algorithm
     Paper: https://arxiv.org/abs/1707.06347.
     """
@@ -96,6 +208,15 @@ class PPOTrainer(BaseRLTrainer):
     def obs_space(self):
         if self._obs_space is None and self.envs is not None:
             self._obs_space = self.envs.observation_spaces[0]
+            # self._obs_space.spaces["depth"] = gym.spaces.Box(0, 1,
+            #                                     (self.config.ARCHITECTURE.frame_height,
+            #                                         self.config.ARCHITECTURE.frame_width,1),
+            #                                     dtype='uint8')
+
+            # self._obs_space.spaces["rgb"] = gym.spaces.Box(0, 255,
+            #                                     (self.config.ARCHITECTURE.frame_height,
+            #                                         self.config.ARCHITECTURE.frame_width,3),
+            #                                     dtype='uint8')
 
         return self._obs_space
 
@@ -150,7 +271,7 @@ class PPOTrainer(BaseRLTrainer):
 
         if self.config.RL.DDPPO.pretrained:
             self.actor_critic.load_state_dict(
-                {  # type: ignore
+                {
                     k[len("actor_critic.") :]: v
                     for k, v in pretrained_state["state_dict"].items()
                 }
@@ -272,7 +393,7 @@ class PPOTrainer(BaseRLTrainer):
 
         self._setup_actor_critic_agent(ppo_cfg)
         if self._is_distributed:
-            self.agent.init_distributed(find_unused_params=True)  # type: ignore
+            self.agent.init_distributed(find_unused_params=True)
 
         logger.info(
             "agent number of parameters: {}".format(
@@ -296,31 +417,44 @@ class PPOTrainer(BaseRLTrainer):
             )
 
         self._nbuffers = 2 if ppo_cfg.use_double_buffered_sampler else 1
-
-        self.rollouts = RolloutStorage(
-            ppo_cfg.num_steps,
-            self.envs.num_envs,
-            obs_space,
-            self.policy_action_space,
-            ppo_cfg.hidden_size,
-            num_recurrent_layers=self.actor_critic.net.num_recurrent_layers,
-            is_double_buffered=ppo_cfg.use_double_buffered_sampler,
-            action_shape=action_shape,
-            discrete_actions=discrete_actions,
-        )
+        if self.config.RL.POLICY.name !='PointNavAuxDepthBaselinePolicy':
+            self.rollouts = RolloutStorage(
+                ppo_cfg.num_steps,
+                self.envs.num_envs,
+                obs_space,
+                self.policy_action_space,
+                ppo_cfg.hidden_size,
+                num_recurrent_layers=self.actor_critic.net.num_recurrent_layers,
+                is_double_buffered=ppo_cfg.use_double_buffered_sampler,
+                action_shape=action_shape,
+                discrete_actions=discrete_actions,
+            )
+        else:
+            self.rollouts = RolloutStorage(
+                ppo_cfg.num_steps,
+                self.envs.num_envs,
+                obs_space,
+                self.policy_action_space,
+                ppo_cfg.hidden_size,
+                num_recurrent_layers=self.actor_critic.net.num_recurrent_layers,
+                is_double_buffered=ppo_cfg.use_double_buffered_sampler,
+                action_shape=action_shape,
+                discrete_actions=discrete_actions,
+                depth_prediction_size=obs_space["depth"].shape,
+            )
         self.rollouts.to(self.device)
 
         observations = self.envs.reset()
         batch = batch_obs(
             observations, device=self.device, cache=self._obs_batching_cache
         )
-        batch = apply_obs_transforms_batch(batch, self.obs_transforms)  # type: ignore
+        batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
         if self._static_encoder:
             with torch.no_grad():
                 batch["visual_features"] = self._encoder(batch)
 
-        self.rollouts.buffers["observations"][0] = batch  # type: ignore
+        self.rollouts.buffers["observations"][0] = batch
 
         self.current_episode_reward = torch.zeros(self.envs.num_envs, 1)
         self.running_episode_stats = dict(
@@ -428,18 +562,36 @@ class PPOTrainer(BaseRLTrainer):
                 env_slice,
             ]
 
-            profiling_wrapper.range_push("compute actions")
-            (
-                values,
-                actions,
-                actions_log_probs,
-                recurrent_hidden_states,
-            ) = self.actor_critic.act(
-                step_batch["observations"],
-                step_batch["recurrent_hidden_states"],
-                step_batch["prev_actions"],
-                step_batch["masks"],
-            )
+            depth_predictions = None
+
+            if self.config.RL.POLICY.name == 'PointNavAuxDepthBaselinePolicy':
+
+                profiling_wrapper.range_push("compute actions")
+                (
+                    values,
+                    actions,
+                    actions_log_probs,
+                    recurrent_hidden_states,
+                    depth_predictions,
+                ) = self.actor_critic.act(
+                    step_batch["observations"],
+                    step_batch["recurrent_hidden_states"],
+                    step_batch["prev_actions"],
+                    step_batch["masks"],
+                )
+            else:
+                profiling_wrapper.range_push("compute actions")
+                (
+                    values,
+                    actions,
+                    actions_log_probs,
+                    recurrent_hidden_states,
+                ) = self.actor_critic.act(
+                    step_batch["observations"],
+                    step_batch["recurrent_hidden_states"],
+                    step_batch["prev_actions"],
+                    step_batch["masks"],
+                )
 
         # NB: Move actions to CPU.  If CUDA tensors are
         # sent in to env.step(), that will create CUDA contexts
@@ -464,13 +616,24 @@ class PPOTrainer(BaseRLTrainer):
 
         self.env_time += time.time() - t_step_env
 
-        self.rollouts.insert(
-            next_recurrent_hidden_states=recurrent_hidden_states,
-            actions=actions,
-            action_log_probs=actions_log_probs,
-            value_preds=values,
-            buffer_index=buffer_index,
-        )
+        if self.config.RL.POLICY.name == 'PointNavAuxDepthBaselinePolicy':
+
+            self.rollouts.insert(
+                next_recurrent_hidden_states=recurrent_hidden_states,
+                actions=actions,
+                action_log_probs=actions_log_probs,
+                value_preds=values,
+                buffer_index=buffer_index,
+                next_depth_predictions=depth_predictions,
+            )
+        else:
+            self.rollouts.insert(
+                next_recurrent_hidden_states=recurrent_hidden_states,
+                actions=actions,
+                action_log_probs=actions_log_probs,
+                value_preds=values,
+                buffer_index=buffer_index,
+            )
 
     def _collect_environment_result(self, buffer_index: int = 0):
         num_envs = self.envs.num_envs
@@ -495,7 +658,7 @@ class PPOTrainer(BaseRLTrainer):
         batch = batch_obs(
             observations, device=self.device, cache=self._obs_batching_cache
         )
-        batch = apply_obs_transforms_batch(batch, self.obs_transforms)  # type: ignore
+        batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
         rewards = torch.tensor(
             rewards_l,
@@ -649,11 +812,14 @@ class PPOTrainer(BaseRLTrainer):
             for k, v in deltas.items()
             if k not in {"reward", "count"}
         }
+        if len(metrics) > 0:
+            writer.add_scalars("metrics", metrics, self.num_steps_done)
 
-        for k, v in metrics.items():
-            writer.add_scalar(f"metrics/{k}", v, self.num_steps_done)
-        for k, v in losses.items():
-            writer.add_scalar(f"losses/{k}", v, self.num_steps_done)
+        writer.add_scalars(
+            "losses",
+            losses,
+            self.num_steps_done,
+        )
 
         # log stats
         if self.num_updates_done % self.config.LOG_INTERVAL == 0:
@@ -741,7 +907,7 @@ class PPOTrainer(BaseRLTrainer):
         ppo_cfg = self.config.RL.PPO
 
         with (
-            TensorboardWriter(  # type: ignore
+            TensorboardWriter(
                 self.config.TENSORBOARD_DIR, flush_secs=self.flush_secs
             )
             if rank0_only()
@@ -838,11 +1004,7 @@ class PPOTrainer(BaseRLTrainer):
 
                 self.num_updates_done += 1
                 losses = self._coalesce_post_step(
-                    dict(
-                        value_loss=value_loss,
-                        action_loss=action_loss,
-                        entropy=dist_entropy,
-                    ),
+                    dict(value_loss=value_loss, action_loss=action_loss),
                     count_steps_delta,
                 )
 
@@ -927,7 +1089,7 @@ class PPOTrainer(BaseRLTrainer):
         batch = batch_obs(
             observations, device=self.device, cache=self._obs_batching_cache
         )
-        batch = apply_obs_transforms_batch(batch, self.obs_transforms)  # type: ignore
+        batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
         current_episode_reward = torch.zeros(
             self.envs.num_envs, 1, device="cpu"
@@ -1015,12 +1177,12 @@ class PPOTrainer(BaseRLTrainer):
             observations, rewards_l, dones, infos = [
                 list(x) for x in zip(*outputs)
             ]
-            batch = batch_obs(  # type: ignore
+            batch = batch_obs(
                 observations,
                 device=self.device,
                 cache=self._obs_batching_cache,
             )
-            batch = apply_obs_transforms_batch(batch, self.obs_transforms)  # type: ignore
+            batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
             not_done_masks = torch.tensor(
                 [[not done] for done in dones],
@@ -1045,9 +1207,8 @@ class PPOTrainer(BaseRLTrainer):
                 # episode ended
                 if not not_done_masks[i].item():
                     pbar.update()
-                    episode_stats = {
-                        "reward": current_episode_reward[i].item()
-                    }
+                    episode_stats = {}
+                    episode_stats["reward"] = current_episode_reward[i].item()
                     episode_stats.update(
                         self._extract_scalars_from_info(infos[i])
                     )
@@ -1116,12 +1277,14 @@ class PPOTrainer(BaseRLTrainer):
         if "extra_state" in ckpt_dict and "step" in ckpt_dict["extra_state"]:
             step_id = ckpt_dict["extra_state"]["step"]
 
-        writer.add_scalar(
-            "eval_reward/average_reward", aggregated_stats["reward"], step_id
+        writer.add_scalars(
+            "eval_reward",
+            {"average reward": aggregated_stats["reward"]},
+            step_id,
         )
 
         metrics = {k: v for k, v in aggregated_stats.items() if k != "reward"}
-        for k, v in metrics.items():
-            writer.add_scalar(f"eval_metrics/{k}", v, step_id)
+        if len(metrics) > 0:
+            writer.add_scalars("eval_metrics", metrics, step_id)
 
         self.envs.close()

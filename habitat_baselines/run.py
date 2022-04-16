@@ -6,6 +6,7 @@
 
 import argparse
 import random
+import os
 
 import numpy as np
 import torch
@@ -73,6 +74,7 @@ def run_exp(exp_config: str, run_type: str, opts=None) -> None:
     Returns:
         None.
     """
+    # print("fetching yaml from {}".format(os.listdir(os.path.join(os.getcwd(),exp_config))))
     config = get_config(exp_config, opts)
     execute_exp(config, run_type)
 

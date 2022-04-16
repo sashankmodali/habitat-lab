@@ -87,3 +87,9 @@ data
 
 # vim
 *.swp
+
+# tensorboard
+tb/**
+
+#some random file
+\=1.3.1
