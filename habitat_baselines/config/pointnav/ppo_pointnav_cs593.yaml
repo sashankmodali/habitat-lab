@@ -4,7 +4,7 @@ VERBOSE: False
 
 BASE_TASK_CONFIG_PATH: "configs/tasks/pointnav_gibson_cs593.yaml"
 TRAINER_NAME: "ppo"
-ENV_NAME: "NavRLEnv"
+ENV_NAME: "PointNavigRLEnv"
 SIMULATOR_GPU_ID: 0
 TORCH_GPU_ID: 0
 VIDEO_OPTION: []
@@ -16,7 +16,7 @@ VIDEO_DIR: "video_dir"
 TEST_EPISODE_COUNT: -1
 EVAL_CKPT_PATH_DIR: "data/new_checkpoints"
 NUM_ENVIRONMENTS: 2
-SENSORS: ["RGB_SENSOR", "DEPTH_SENSOR"]
+SENSORS: ["DEPTH_SENSOR"]
 CHECKPOINT_FOLDER: "data/new_checkpoints"
 TOTAL_NUM_STEPS: 75e6
 NUM_UPDATES: -1
@@ -29,6 +29,8 @@ FORCE_TORCH_SINGLE_THREADED: True
 
 TRAINER_NAME: "ppo_cs593"
 
+NOSTOP: True
+
 
 ARCHITECTURE:
   # CS593 project params
@@ -40,8 +42,9 @@ ARCHITECTURE:
   camera_height: 1.25
 
 RL:
+  TRAIN_LOCAL: True
   POLICY:
-    name: 'PointNavResNetBaselinePolicy' # choose between 'PointNavBaselinePolicy', 'PointNavResNetBaselinePolicy' 'PointNavAuxDepthBaselinePolicy'
+    name: 'PointNavBaselinePolicy' # choose between 'PointNavBaselinePolicy', 'PointNavResNetBaselinePolicy' 'PointNavAuxDepthBaselinePolicy'
     OBS_TRANSFORMS:
       ENABLED_TRANSFORMS: ["ResizeShortestEdge"]
       RESIZE_SHORTEST_EDGE: 

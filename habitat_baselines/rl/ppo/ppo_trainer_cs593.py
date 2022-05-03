@@ -9,7 +9,7 @@ import os
 import random
 import time
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Optional, Union, Type, Tuple
+from typing import Any, Dict, List, Optional, Union, Type, Tuple, OrderedDict
 
 import gym
 import numpy as np
@@ -48,6 +48,7 @@ from habitat_baselines.rl.ddppo.ddp_utils import (
 from habitat_baselines.rl.ddppo.policy import (  # noqa: F401.
     PointNavResNetPolicy,
 )
+from habitat.core.spaces import ActionSpace, EmptySpace
 from habitat_baselines.rl.ppo import PPO
 from habitat_baselines.rl.ppo.policy import Policy
 from habitat_baselines.utils.common import (
@@ -62,6 +63,7 @@ from habitat.utils.geometry_utils import (
     quaternion_from_coeff,
     quaternion_rotate_vector,
 )
+from habitat.sims.habitat_simulator.actions import HabitatSimActions
 from habitat.core.simulator import Observations
 import copy
 
@@ -72,10 +74,17 @@ class PointNavigRLEnv(NavRLEnv):
     
         super().__init__(config, dataset)
 
+        if config.NOSTOP:
+            self.action_space.spaces = OrderedDict([("MOVE_FOWARD", EmptySpace()),
+                ("TURN_LEFT", EmptySpace()),
+                ("TURN_RIGHT", EmptySpace()),])
+        self.no_stop = config.NOSTOP
+        self._previous_action = None
+
     def reset(self) -> Observations:
         # self._previous_action = None
         result = super().reset()
-
+        self._previous_action = None
 
         # print("\n\n\n Debug!!! : {}\n\n\n".format(self.habitat_env.current_episode.goals))
         # raise Exception("Yes")
@@ -123,6 +132,17 @@ class PointNavigRLEnv(NavRLEnv):
         return result
 
     def step(self, *args, **kwargs) -> Tuple[Observations, Any, bool, dict]:
+        # print("\n\n\n\n\nDebugging!! : {}\n\n\n\n\n".format((args,kwargs)))
+        if self.no_stop:
+            # Action remapping. This is because we have only MOVE_FORWARD, TURN_LEFT, TURN_RIGHT which are mapped from 0,1,2 to 1,2,3
+            if kwargs['action']['action'] == 0: # Forward
+                kwargs['action']['action'] = 1
+            elif kwargs['action']['action'] == 1: # Left
+                kwargs['action']['action'] = 2
+            elif kwargs['action']['action'] == 2: # Right
+                kwargs['action']['action'] = 3
+            elif (kwargs['action']['action'] == 3):# Stop
+                kwargs['action']['action'] = 0
 
         result = super().step(*args, **kwargs)
 
@@ -131,6 +151,29 @@ class PointNavigRLEnv(NavRLEnv):
 
 
         return  result
+
+    def _distance_target(self)-> float:
+        current_position = self._env.sim.get_agent_state().position.tolist()
+        target_position = self._env.current_episode.goals[0].position
+        distance = self._env.sim.geodesic_distance(
+            current_position, target_position
+        )
+        return distance
+
+    def _episode_success(self)-> bool:
+        if (
+            (self.no_stop or self._previous_action == HabitatSimActions.STOP)
+            and
+            self._distance_target() < 0.2
+        ):
+            return True
+        return False
+
+    def get_done(self, observations: Observations)-> bool:
+        done = False
+        if self._env.episode_over or self._episode_success():
+            done = True
+        return done
 
 
 
