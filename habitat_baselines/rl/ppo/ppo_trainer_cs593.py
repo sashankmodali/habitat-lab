@@ -9,7 +9,7 @@ import os
 import random
 import time
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Optional, Union, Type
+from typing import Any, Dict, List, Optional, Union, Type, Tuple
 
 import gym
 import numpy as np
@@ -20,7 +20,7 @@ from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
 import habitat
 
-from habitat import Config, logger, Env, RLEnv, VectorEnv, make_dataset
+from habitat import Config, logger, Env, RLEnv, VectorEnv, make_dataset, Dataset
 from habitat.utils import profiling_wrapper
 from habitat.utils.visualizations.utils import observations_to_image
 from habitat_baselines.common.base_trainer import BaseRLTrainer
@@ -56,6 +56,81 @@ from habitat_baselines.utils.common import (
     batch_obs,
     generate_video,
 )
+from habitat_baselines.common.environments import NavRLEnv
+from habitat.tasks.utils import cartesian_to_polar
+from habitat.utils.geometry_utils import (
+    quaternion_from_coeff,
+    quaternion_rotate_vector,
+)
+from habitat.core.simulator import Observations
+import copy
+
+
+@baseline_registry.register_env(name="PointNavigRLEnv")
+class PointNavigRLEnv(NavRLEnv):
+    def __init__(self, config: Config, dataset: Optional[Dataset] = None):
+    
+        super().__init__(config, dataset)
+
+    def reset(self) -> Observations:
+        # self._previous_action = None
+        result = super().reset()
+
+
+        # print("\n\n\n Debug!!! : {}\n\n\n".format(self.habitat_env.current_episode.goals))
+        # raise Exception("Yes")
+
+        current_position = np.array(self._env.sim.get_agent_state().position.tolist())
+        target_position = np.array(self._env.current_episode.goals[0].position)
+        source_rotation = self._env.sim.get_agent_state().rotation
+
+        direction_vector = target_position - current_position
+        direction_vector_agent = quaternion_rotate_vector(
+            source_rotation.inverse(), direction_vector
+        )
+
+        flag = False;
+
+        while flag is not True:
+            length = np.sqrt(np.random.uniform(0, 0.25))
+            angle = np.pi * np.random.uniform(0, 2)
+
+            x = length * np.cos(angle)
+            y = length * np.sin(angle)
+
+            new_target_position = current_position + quaternion_rotate_vector(
+                source_rotation, np.array([y,direction_vector_agent[1],-x])
+            )
+            flag = self._env.sim.is_navigable(new_target_position)
+            # print("finding another goal now")
+
+        rho, phi = cartesian_to_polar(
+                x, y
+            )
+        new_target_position = copy.deepcopy(current_position)
+        # self.habitat_env.current_episode.goals[0].position = copy.deepcopy(new_target_position) # debugs
+
+        self.habitat_env.current_episode.info['geodesic_distance'] = copy.deepcopy(self._env.sim.geodesic_distance(current_position, new_target_position))
+
+
+        result['pointgoal_with_gps_compass'] = np.array([rho, -phi], dtype=np.float32) # rho
+
+        # print("\n\n\n Debug!!! : {}\n\n\n".format((self.habitat_env.current_episode,rho,self.habitat_env.get_metrics(),self.habitat_env._task.measurements)))
+        self.habitat_env._task.measurements.update_measures(self.habitat_env.current_episode,self.habitat_env._task)
+        # print("\n\n\n Debug!!! : {}\n\n\n".format((self.habitat_env.current_episode,rho,self.habitat_env.get_metrics(),self.habitat_env._task.measurements)))
+        # raise Exception("Yes")
+
+        return result
+
+    def step(self, *args, **kwargs) -> Tuple[Observations, Any, bool, dict]:
+
+        result = super().step(*args, **kwargs)
+
+        # print("\n\n\n Debug!!! : {}\n\n\n".format((self._env.current_episode,result[0],result[3])))
+        # print("\n\n\n Debugging!!! : {}\n\n\n".format((self.habitat_env.current_episode)))
+
+
+        return  result
 
 
 
@@ -76,6 +151,7 @@ def make_env_fn(
     dataset = make_dataset(
         config.TASK_CONFIG.DATASET.TYPE, config=config.TASK_CONFIG.DATASET
     )
+    # print("\n\n\n Debug 2 : {}\n\n\n".format(config))
     env = env_class(config=config, dataset=dataset)
     env.seed(config.TASK_CONFIG.SEED)
     return env
@@ -101,7 +177,8 @@ def construct_envs(
     num_environments = config.NUM_ENVIRONMENTS
     configs = []
     env_classes = [env_class for _ in range(num_environments)]
-    print("\n\n\n\nDataset config : \n{}\n\n\n ".format(config.TASK_CONFIG.DATASET))
+    # print("\n\n\n\nDataset config : \n{}\n\n\n ".format(config.TASK_CONFIG.DATASET))
+    # print("fetching scenes from {}".format(os.listdir(os.path.join(os.getcwd(),config.TASK_CONFIG_DATASET.DATA_PATH))))
     dataset = make_dataset(config.TASK_CONFIG.DATASET.TYPE)
     scenes = config.TASK_CONFIG.DATASET.CONTENT_SCENES
     if "*" in config.TASK_CONFIG.DATASET.CONTENT_SCENES:
@@ -368,6 +445,9 @@ class PPOTrainer_CS593(BaseRLTrainer):
             num_steps_to_capture=self.config.PROFILING.NUM_STEPS_TO_CAPTURE,
         )
 
+
+
+
         self._init_envs()
 
         if self.using_velocity_ctrl:
@@ -397,7 +477,8 @@ class PPOTrainer_CS593(BaseRLTrainer):
 
         logger.info(
             "agent number of parameters: {}".format(
-                sum(param.numel() for param in self.agent.parameters())
+                sum(param.numel() for param in self.agent.parameters() if param.requires_grad)
+
             )
         )
 
@@ -445,6 +526,7 @@ class PPOTrainer_CS593(BaseRLTrainer):
         self.rollouts.to(self.device)
 
         observations = self.envs.reset()
+
         batch = batch_obs(
             observations, device=self.device, cache=self._obs_batching_cache
         )
@@ -531,7 +613,6 @@ class PPOTrainer_CS593(BaseRLTrainer):
             # Strings also have an np.size of 1, so explicitly ban those
             elif np.size(v) == 1 and not isinstance(v, str):
                 result[k] = float(v)
-
         return result
 
     @classmethod
@@ -651,6 +732,12 @@ class PPOTrainer_CS593(BaseRLTrainer):
         observations, rewards_l, dones, infos = [
             list(x) for x in zip(*outputs)
         ]
+
+        # print("\n\n\n\n Debug-1 :{}\n\n\n".format((observations, infos)))
+        # print("\n\n\n\n Debug-2!! :{} \n\n\n\n".format((info)))
+        # raise Exception("Debuggingpurposes")
+
+        # print("\n\n\n\n debug :{}\n\n\n".format((self.env)))
 
         self.env_time += time.time() - t_step_env
 
@@ -1177,6 +1264,8 @@ class PPOTrainer_CS593(BaseRLTrainer):
             observations, rewards_l, dones, infos = [
                 list(x) for x in zip(*outputs)
             ]
+
+
             batch = batch_obs(
                 observations,
                 device=self.device,
