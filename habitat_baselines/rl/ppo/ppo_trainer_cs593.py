@@ -101,23 +101,24 @@ class PointNavigRLEnv(NavRLEnv):
         flag = False;
 
         while flag is not True:
-            length = np.sqrt(np.random.uniform(0, 0.25))
+            length = np.random.uniform(0, 0.25)
             angle = np.pi * np.random.uniform(0, 2)
 
             x = length * np.cos(angle)
             y = length * np.sin(angle)
 
             new_target_position = current_position + quaternion_rotate_vector(
-                source_rotation, np.array([y,direction_vector_agent[1],-x])
+                source_rotation, np.array([y,0,-x])
             )
+            # new_target_position = copy.deepcopy(current_position)
             flag = self._env.sim.is_navigable(new_target_position)
             # print("finding another goal now")
 
         rho, phi = cartesian_to_polar(
                 x, y
             )
-        new_target_position = copy.deepcopy(current_position)
-        # self.habitat_env.current_episode.goals[0].position = copy.deepcopy(new_target_position) # debugs
+        # new_target_position = copy.deepcopy(current_position)
+        self.habitat_env.current_episode.goals[0].position = copy.deepcopy(new_target_position) # debugs
 
         self.habitat_env.current_episode.info['geodesic_distance'] = copy.deepcopy(self._env.sim.geodesic_distance(current_position, new_target_position))
 
@@ -126,7 +127,7 @@ class PointNavigRLEnv(NavRLEnv):
 
         # print("\n\n\n Debug!!! : {}\n\n\n".format((self.habitat_env.current_episode,rho,self.habitat_env.get_metrics(),self.habitat_env._task.measurements)))
         self.habitat_env._task.measurements.update_measures(self.habitat_env.current_episode,self.habitat_env._task)
-        # print("\n\n\n Debug!!! : {}\n\n\n".format((self.habitat_env.current_episode,rho,self.habitat_env.get_metrics(),self.habitat_env._task.measurements)))
+        # print("\n\n\n Debug!!! : {}\n\n\n".format((self.habitat_env.current_episode,rho,self.habitat_env.get_metrics(),self.habitat_env._task.action_space)))
         # raise Exception("Yes")
 
         return result
@@ -144,7 +145,18 @@ class PointNavigRLEnv(NavRLEnv):
             elif (kwargs['action']['action'] == 3):# Stop
                 kwargs['action']['action'] = 0
 
+        current_position = np.array(self._env.sim.get_agent_state().position.tolist())
+        target_position = np.array(self._env.current_episode.goals[0].position)
+        distance = self._env.sim.geodesic_distance(current_position,target_position) 
+
+        if distance < 0.2:
+            kwargs['action']['action'] = 0
+
+        # print(distance,kwargs['action']['action'])
+
         result = super().step(*args, **kwargs)
+
+        # print(result[0]['pointgoal_with_gps_compass'],result[2])
 
         # print("\n\n\n Debug!!! : {}\n\n\n".format((self._env.current_episode,result[0],result[3])))
         # print("\n\n\n Debugging!!! : {}\n\n\n".format((self.habitat_env.current_episode)))
